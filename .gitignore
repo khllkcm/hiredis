@@ -3,5 +3,6 @@
 /*.o
 /*.so
 /*.dylib
+/*.dll
 /*.a
 /*.pc

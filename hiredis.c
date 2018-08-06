@@ -43,6 +43,17 @@
 #include "net.h"
 #include "sds.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#define F_EINTR 0
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#define F_EINTR EINTR
+#endif
+
 static redisReply *createReplyObject(int type);
 static void *createStringObject(const redisReadTask *task, char *str, size_t len);
 static void *createArrayObject(const redisReadTask *task, int elements);
@@ -597,6 +608,12 @@ static redisContext *redisContextInit(void) {
         redisFree(c);
         return NULL;
     }
+#ifdef HAVE_LIBSSH2
+    c->ssl = NULL;
+    c->ssl_ctx = NULL;
+    c->session = NULL;
+    c->channel = NULL;
+#endif
 
     return c;
 }
@@ -604,8 +621,29 @@ static redisContext *redisContextInit(void) {
 void redisFree(redisContext *c) {
     if (c == NULL)
         return;
+#ifdef HAVE_LIBSSH2
+    if (c->ssl) {
+      SSL_free(c->ssl);
+      c->ssl = NULL;
+    }
+    if (c->ssl_ctx) {
+      SSL_CTX_free(c->ssl_ctx);
+      c->ssl_ctx = NULL;
+    }
+    if(c->channel != NULL){
+        libssh2_channel_free(c->channel);
+    }
+    if(c->session != NULL){
+        libssh2_session_disconnect(c->session, "Client disconnecting normally");
+        libssh2_session_free(c->session);
+    }
+#endif
     if (c->fd > 0)
+#ifdef _WIN32
+        closesocket(c->fd);
+#else
         close(c->fd);
+#endif
     sdsfree(c->obuf);
     redisReaderFree(c->reader);
     free(c->tcp.host);
@@ -627,7 +665,11 @@ int redisReconnect(redisContext *c) {
     memset(c->errstr, '\0', strlen(c->errstr));
 
     if (c->fd > 0) {
+#ifdef _WIN32
+        closesocket(c->fd);
+#else
         close(c->fd);
+#endif
     }
 
     sdsfree(c->obuf);
@@ -653,6 +695,150 @@ int redisReconnect(redisContext *c) {
 /* Connect to a Redis instance. On error the field error in the returned
  * context will be set to the return value of the error function.
  * When no set of reply functions is given, the default set will be used. */
+#ifdef HAVE_LIBSSH2
+redisContext *redisConnectSSH(const char *ip, int port, const char *ssh_address, int ssh_port, const char *username, const char *password,
+                           const char *public_key, const char *private_key, const char *passphrase, int is_ssl, int method) {
+
+  redisContext *c = redisContextInit();
+  if (c == NULL) {
+    return NULL;
+  }
+
+  SSL_CTX *ssl_ctx = NULL;
+  SSL *ssl = NULL;
+  LIBSSH2_SESSION *session = NULL;
+  if (is_ssl) {
+    struct hostent* host = gethostbyname(ip);
+    if(!host){
+      __redisSetError(c, REDIS_ERR_OTHER, "Failed to resolve ssh address.");
+      return c;
+    }
+
+    struct sockaddr_in sin;
+    /* Connect to SSH server */
+    int server_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sin.sin_family = AF_INET;
+    sin.sin_addr = *(struct in_addr *)host->h_addr;
+    sin.sin_port = htons(port);
+    if (connect(server_sock, (struct sockaddr*)(&sin),
+                sizeof(struct sockaddr_in)) != 0) {
+      __redisSetError(c, REDIS_ERR_OTHER, "Failed to connect (ssl_address).");
+      return c;
+    }
+
+    const SSL_METHOD *method = SSLv23_client_method();
+    if ((ssl_ctx = SSL_CTX_new(method)) == NULL) {
+      close(server_sock);
+      __redisSetError(c, REDIS_ERR_OTHER, "Unable to create a new SSL context structure.");
+      return c;
+    }
+
+    /* ---------------------------------------------------------- *
+     * Disabling SSLv2 will leave v3 and TSLv1 for negotiation    *
+     * ---------------------------------------------------------- */
+    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2);
+
+    /* ---------------------------------------------------------- *
+     * Create new SSL connection state object                     *
+     * ---------------------------------------------------------- */
+    ssl = SSL_new(ssl_ctx);
+
+    /* ---------------------------------------------------------- *
+     * Attach the SSL session to the socket descriptor            *
+     * ---------------------------------------------------------- */
+    SSL_set_fd(ssl, server_sock);
+  } else if(ssh_address && method != SSH_UNKNOWN){
+    if (method == SSH_PUBLICKEY && !private_key) {
+      __redisSetError(c, REDIS_ERR_OTHER, "Invalid input argument(private key)");
+      return c;
+    } else if (method == SSH_PASSWORD && !password) {
+      __redisSetError(c, REDIS_ERR_OTHER, "Invalid input argument(password)");
+      return c;
+    }
+
+    int rc = libssh2_init(0);
+    if (rc != 0) {
+      __redisSetError(c, REDIS_ERR_OTHER, "Failed to init libssh library.");
+      return c;
+    }
+
+    struct hostent* host = gethostbyname(ssh_address);
+    if(!host){
+      __redisSetError(c, REDIS_ERR_OTHER, "Failed to resolve ssh address.");
+      return c;
+    }
+
+    struct sockaddr_in sin;
+    /* Connect to SSH server */
+    int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sin.sin_family = AF_INET;
+    sin.sin_addr = *(struct in_addr *)host->h_addr;
+    sin.sin_port = htons(ssh_port);
+    if (connect(sock, (struct sockaddr*)(&sin),
+                sizeof(struct sockaddr_in)) != 0) {
+      __redisSetError(c, REDIS_ERR_OTHER, "Failed to connect (ssh_address).");
+      return c;
+    }
+
+    /* Create a session instance */
+    session = libssh2_session_init();
+    if(!session) {
+      __redisSetError(c, REDIS_ERR_OTHER, "Failed to create ssh session.");
+      return c;
+    }
+
+    /* ... start it up. This will trade welcome banners, exchange keys,
+     * and setup crypto, compression, and MAC layers
+     */
+    rc = libssh2_session_handshake(session, sock);
+    if(rc) {
+      libssh2_session_free(session);
+      __redisSetError(c, REDIS_ERR_OTHER, "SSH handshake failed.");
+      return c;
+    }
+
+    int auth_pw = SSH_UNKNOWN;
+    libssh2_hostkey_hash(session, LIBSSH2_HOSTKEY_HASH_SHA1);
+    char *userauthlist = libssh2_userauth_list(session, username, strlen(username));
+    if (strstr(userauthlist, "password") != NULL) {
+      auth_pw |= SSH_PASSWORD;
+    }
+    if (strstr(userauthlist, "keyboard-interactive") != NULL) {
+      auth_pw |= SSH_INTERACTIVE;
+    }
+    if (strstr(userauthlist, "publickey") != NULL) {
+      auth_pw |= SSH_PUBLICKEY;
+    }
+
+    if (auth_pw & SSH_PASSWORD && method == SSH_PASSWORD) {
+      /* We could authenticate via password */
+      if (libssh2_userauth_password(session, username, password)) {
+        libssh2_session_free(session);
+        __redisSetError(c, REDIS_ERR_OTHER, "Authentication by password failed!");
+        return c;
+      }
+    } else if (auth_pw & SSH_PUBLICKEY && method == SSH_PUBLICKEY) {
+      /* Or by public key */
+      if (libssh2_userauth_publickey_fromfile(session, username, public_key, private_key, passphrase)){
+        libssh2_session_free(session);
+        __redisSetError(c, REDIS_ERR_OTHER, "Authentication by public key failed!");
+        return c;
+      }
+    } else {
+      libssh2_session_free(session);
+      __redisSetError(c, REDIS_ERR_OTHER, "No supported authentication methods found!");
+      return c;
+    }
+  }
+
+  c->ssl = ssl;
+  c->ssl_ctx = ssl_ctx;
+  c->session = session;
+  c->flags |= REDIS_BLOCK;
+  redisContextConnectTcp(c,ip,port,NULL);
+  return c;
+}
+#endif
 redisContext *redisConnect(const char *ip, int port) {
     redisContext *c;
 
@@ -784,10 +970,24 @@ int redisBufferRead(redisContext *c) {
     /* Return early when the context has seen an error. */
     if (c->err)
         return REDIS_ERR;
-
+#ifdef HAVE_LIBSSH2
+    if (c->ssl) {
+        nread = SSL_read(c->ssl, buf, sizeof(buf));
+    } else if(c->channel) {
+        nread = libssh2_channel_read(c->channel, buf, sizeof(buf));
+    }
+    else{
+#endif
+#ifdef _WIN32
+    nread = recv(c->fd,buf,sizeof(buf),0);
+#else
     nread = read(c->fd,buf,sizeof(buf));
+#endif
+#ifdef HAVE_LIBSSH2
+    }
+#endif
     if (nread == -1) {
-        if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == EINTR)) {
+        if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == F_EINTR)) {
             /* Try again later */
         } else {
             __redisSetError(c,REDIS_ERR_IO,NULL);
@@ -822,9 +1022,24 @@ int redisBufferWrite(redisContext *c, int *done) {
         return REDIS_ERR;
 
     if (sdslen(c->obuf) > 0) {
+#ifdef HAVE_LIBSSH2
+	if (c->ssl) {
+		nwritten = SSL_write(c->ssl, c->obuf, sdslen(c->obuf));
+	    } else if(c->channel){
+		nwritten = libssh2_channel_write(c->channel, c->obuf, sdslen(c->obuf));
+	    }
+	    else{
+#endif
+#ifdef _WIN32
+        nwritten = send(c->fd,c->obuf,sdslen(c->obuf),0);
+#else
         nwritten = write(c->fd,c->obuf,sdslen(c->obuf));
+#endif
+#ifdef HAVE_LIBSSH2
+	}
+#endif
         if (nwritten == -1) {
-            if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == EINTR)) {
+            if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == F_EINTR)) {
                 /* Try again later */
             } else {
                 __redisSetError(c,REDIS_ERR_IO,NULL);
@@ -842,6 +1057,70 @@ int redisBufferWrite(redisContext *c, int *done) {
     if (done != NULL) *done = (sdslen(c->obuf) == 0);
     return REDIS_OK;
 }
+
+#ifdef HAVE_LIBSSH2
+int redisReadToBuffer(redisContext *c, char* buf, int size, ssize_t *nread)
+{
+    *nread = -1;
+    /* Return early when the context has seen an error. */
+    if (c->err){
+        return REDIS_ERR;
+    }
+
+    if (c->ssl) {
+        *nread = SSL_read(c->ssl, buf, size);
+    } else if(c->channel){
+        *nread = libssh2_channel_read(c->channel, buf, size);
+    }
+    else{
+        #ifdef _WIN32
+            *nread = recv(c->fd,buf,size,0);
+        #else
+            *nread = read(c->fd, buf, size);
+        #endif
+    }
+
+    if (*nread == -1) {
+        if ((errno == EAGAIN && !(c->flags & REDIS_BLOCK)) || (errno == F_EINTR)) {
+            *nread = 0;
+        } else {
+            return REDIS_ERR;
+        }
+    }
+
+    return REDIS_OK;
+}
+
+int redisWriteFromBuffer(redisContext *c, const char *buf, ssize_t *nwritten)
+{
+    *nwritten = -1;
+
+    /* Return early when the context has seen an error. */
+    if (c->err)
+        return REDIS_ERR;
+
+    size_t len = strlen(buf);
+
+    if (len > 0) {
+        if(c->channel){
+            *nwritten = libssh2_channel_write(c->channel, buf, len);
+        }
+        else{
+    #ifdef _WIN32
+            *nwritten = send(c->fd, buf, len, 0);
+    #else
+            *nwritten = write(c->fd, buf, len);
+    #endif
+        }
+    }
+
+    if (*nwritten == -1) {
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+#endif
 
 /* Internal helper function to try and get a reply from the reader,
  * or set an error in the context otherwise. */

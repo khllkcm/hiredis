@@ -39,6 +39,15 @@
 #include <stdint.h> /* uintXX_t, etc */
 #include "sds.h" /* for sds */
 
+#ifdef HAVE_LIBSSH2
+#include <libssh2.h>
+#include <openssl/ssl.h>
+#define SSH_UNKNOWN 0
+#define SSH_PASSWORD 1
+#define SSH_INTERACTIVE 2
+#define SSH_PUBLICKEY 4
+#endif
+
 #define HIREDIS_MAJOR 0
 #define HIREDIS_MINOR 13
 #define HIREDIS_PATCH 3
@@ -133,9 +142,28 @@ typedef struct redisContext {
     struct {
         char *path;
     } unix_sock;
+#ifdef HAVE_LIBSSH2
+  LIBSSH2_SESSION* session;
+  LIBSSH2_CHANNEL* channel;
 
+  SSL_CTX* ssl_ctx;
+  SSL* ssl;
+#endif
 } redisContext;
 
+#ifdef HAVE_LIBSSH2
+redisContext* redisConnectSSH(const char* ip,
+                           int port,
+                           const char* ssh_address,
+                           int ssh_port,
+                           const char* username,
+                           const char* password,
+                           const char* public_key,
+                           const char* private_key,
+                           const char* passphrase,
+                           int is_ssl,
+                           int method);
+#endif
 redisContext *redisConnect(const char *ip, int port);
 redisContext *redisConnectWithTimeout(const char *ip, int port, const struct timeval tv);
 redisContext *redisConnectNonBlock(const char *ip, int port);
@@ -165,7 +193,10 @@ void redisFree(redisContext *c);
 int redisFreeKeepFd(redisContext *c);
 int redisBufferRead(redisContext *c);
 int redisBufferWrite(redisContext *c, int *done);
-
+#ifdef HAVE_LIBSSH2
+int redisReadToBuffer(redisContext* c, char* buf, int size, ssize_t* readed);
+int redisWriteFromBuffer(redisContext* c, const char* buf, ssize_t* nwritten);
+#endif
 /* In a blocking context, this function first checks if there are unconsumed
  * replies to return and returns one if so. Otherwise, it flushes the output
  * buffer to the socket and reads until it has a reply. In a non-blocking

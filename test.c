@@ -6,7 +6,11 @@
 #include <sys/time.h>
 #include <assert.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <signal.h>
+#endif
 #include <errno.h>
 #include <limits.h>
 
@@ -73,7 +77,7 @@ static redisContext *select_database(redisContext *c) {
     return c;
 }
 
-static int disconnect(redisContext *c, int keep_fd) {
+static int rdisconnect(redisContext *c, int keep_fd) {
     redisReply *reply;
 
     /* Make sure we're on DB 9. */
@@ -91,7 +95,7 @@ static int disconnect(redisContext *c, int keep_fd) {
     return -1;
 }
 
-static redisContext *connect(struct config config) {
+static redisContext *rconnect(struct config config) {
     redisContext *c = NULL;
 
     if (config.type == CONN_TCP) {
@@ -102,7 +106,7 @@ static redisContext *connect(struct config config) {
         /* Create a dummy connection just to get an fd to inherit */
         redisContext *dummy_ctx = redisConnectUnix(config.unix_sock.path);
         if (dummy_ctx) {
-            int fd = disconnect(dummy_ctx, 1);
+            int fd = rdisconnect(dummy_ctx, 1);
             printf("Connecting to inherited fd %d\n", fd);
             c = redisConnectFd(fd);
         }
@@ -248,7 +252,7 @@ static void test_append_formatted_commands(struct config config) {
     char *cmd;
     int len;
 
-    c = connect(config);
+    c = rconnect(config);
 
     test("Append format command: ");
 
@@ -261,7 +265,7 @@ static void test_append_formatted_commands(struct config config) {
     free(cmd);
     freeReplyObject(reply);
 
-    disconnect(c, 0);
+    rdisconnect(c, 0);
 }
 
 static void test_reply_reader(void) {
@@ -463,7 +467,7 @@ static void test_blocking_connection(struct config config) {
     redisContext *c;
     redisReply *reply;
 
-    c = connect(config);
+    c = rconnect(config);
 
     test("Is able to deliver commands: ");
     reply = redisCommand(c,"PING");
@@ -534,7 +538,7 @@ static void test_blocking_connection(struct config config) {
               strcasecmp(reply->element[1]->str,"pong") == 0);
     freeReplyObject(reply);
 
-    disconnect(c, 0);
+    rdisconnect(c, 0);
 }
 
 static void test_blocking_connection_timeouts(struct config config) {
@@ -544,7 +548,7 @@ static void test_blocking_connection_timeouts(struct config config) {
     const char *cmd = "DEBUG SLEEP 3\r\n";
     struct timeval tv;
 
-    c = connect(config);
+    c = rconnect(config);
     test("Successfully completes a command when the timeout is not exceeded: ");
     reply = redisCommand(c,"SET foo fast");
     freeReplyObject(reply);
@@ -554,9 +558,9 @@ static void test_blocking_connection_timeouts(struct config config) {
     reply = redisCommand(c, "GET foo");
     test_cond(reply != NULL && reply->type == REDIS_REPLY_STRING && memcmp(reply->str, "fast", 4) == 0);
     freeReplyObject(reply);
-    disconnect(c, 0);
+    rdisconnect(c, 0);
 
-    c = connect(config);
+    c = rconnect(config);
     test("Does not return a reply when the command times out: ");
     s = write(c->fd, cmd, strlen(cmd));
     tv.tv_sec = 0;
@@ -580,7 +584,7 @@ static void test_blocking_connection_timeouts(struct config config) {
     test_cond(reply != NULL && reply->type == REDIS_REPLY_STATUS && strcmp(reply->str, "PONG") == 0);
     freeReplyObject(reply);
 
-    disconnect(c, 0);
+    rdisconnect(c, 0);
 }
 
 static void test_blocking_io_errors(struct config config) {
@@ -590,7 +594,7 @@ static void test_blocking_io_errors(struct config config) {
     int major, minor;
 
     /* Connect to target given by config. */
-    c = connect(config);
+    c = rconnect(config);
     {
         /* Find out Redis version to determine the path for the next test */
         const char *field = "redis_version:";
@@ -625,7 +629,7 @@ static void test_blocking_io_errors(struct config config) {
         strcmp(c->errstr,"Server closed the connection") == 0);
     redisFree(c);
 
-    c = connect(config);
+    c = rconnect(config);
     test("Returns I/O error on socket timeout: ");
     struct timeval tv = { 0, 1000 };
     assert(redisSetTimeout(c,tv) == REDIS_OK);
@@ -659,7 +663,7 @@ static void test_invalid_timeout_errors(struct config config) {
 }
 
 static void test_throughput(struct config config) {
-    redisContext *c = connect(config);
+    redisContext *c = rconnect(config);
     redisReply **replies;
     int i, num;
     long long t1, t2;
@@ -744,7 +748,7 @@ static void test_throughput(struct config config) {
     free(replies);
     printf("\t(%dx INCRBY (pipelined): %.3fs)\n", num, (t2-t1)/1000000.0);
 
-    disconnect(c, 0);
+    rdisconnect(c, 0);
 }
 
 // static long __test_callback_flags = 0;
@@ -860,7 +864,14 @@ int main(int argc, char **argv) {
     int test_inherit_fd = 1;
 
     /* Ignore broken pipe signal (for I/O error tests). */
+#ifdef _WIN32
+    WSADATA d;
+    if (WSAStartup(0x202, &d) != 0) {
+      _exit(1);
+    }
+#else
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     /* Parse command line options. */
     argv++; argc--;

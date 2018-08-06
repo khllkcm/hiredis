@@ -55,6 +55,9 @@ STLIB_MAKE_CMD=ar rcs $(STLIBNAME)
 
 # Platform-specific overrides
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
+ifeq ($(findstring MINGW,$(uname_S)),MINGW)
+  uname_S := Windows
+endif
 ifeq ($(uname_S),SunOS)
   REAL_LDFLAGS+= -ldl -lnsl -lsocket
   DYLIB_MAKE_CMD=$(CC) -G -o $(DYLIBNAME) -h $(DYLIB_MINOR_NAME) $(LDFLAGS)
@@ -63,6 +66,25 @@ ifeq ($(uname_S),Darwin)
   DYLIBSUFFIX=dylib
   DYLIB_MINOR_NAME=$(LIBNAME).$(HIREDIS_SONAME).$(DYLIBSUFFIX)
   DYLIB_MAKE_CMD=$(CC) -dynamiclib -Wl,-install_name,$(PREFIX)/$(LIBRARY_PATH)/$(DYLIB_MINOR_NAME) -o $(DYLIBNAME) $(LDFLAGS)
+endif
+ifeq ($(uname_S),Windows)
+  DYLIBSUFFIX=dll
+  REAL_LDFLAGS+= -lws2_32
+  REAL_CFLAGS += -Wl,--start-group
+  DYLIB_MAKE_CMD=$(CC) -shared -o $(DYLIBNAME) -Wl,--start-group,--out-implib,$(DYLIBNAME).a $(REAL_LDFLAGS)
+endif
+
+ifeq ($(LIBSSH2_ENABLED),ON)
+LIBSSH2_CFLAGS = -DHAVE_LIBSSH2
+CFLAGS += -Wl,--start-group $(LIBSSH2_CFLAGS)
+ifneq ($(OPENSSL_ROOT_DIR),)
+  LDFLAGS += -L$(OPENSSL_ROOT_DIR)/lib
+  CFLAGS += -I$(OPENSSL_ROOT_DIR)/include
+endif
+LDFLAGS += -lcrypto -lssl -lssh2 -lz
+ifeq ($(uname_S),Windows)
+  LDFLAGS += -lcrypt32
+endif
 endif
 
 all: $(DYLIBNAME) $(STLIBNAME) hiredis-test $(PKGCONFNAME)
@@ -173,7 +195,7 @@ $(PKGCONFNAME): hiredis.h
 	@echo Description: Minimalistic C client library for Redis. >> $@
 	@echo Version: $(HIREDIS_MAJOR).$(HIREDIS_MINOR).$(HIREDIS_PATCH) >> $@
 	@echo Libs: -L\$${libdir} -lhiredis >> $@
-	@echo Cflags: -I\$${includedir} -D_FILE_OFFSET_BITS=64 >> $@
+	@echo Cflags: -I\$${includedir} -D_FILE_OFFSET_BITS=64 $(LIBSSH2_CFLAGS)>> $@
 
 install: $(DYLIBNAME) $(STLIBNAME) $(PKGCONFNAME)
 	mkdir -p $(INSTALL_INCLUDE_PATH) $(INSTALL_INCLUDE_PATH)/adapters $(INSTALL_LIBRARY_PATH)
