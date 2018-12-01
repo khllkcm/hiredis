@@ -54,6 +54,8 @@
 #define F_EINTR EINTR
 #endif
 
+#define h_addr h_addr_list[0]
+
 static redisReply *createReplyObject(int type);
 static void *createStringObject(const redisReadTask *task, char *str, size_t len);
 static void *createArrayObject(const redisReadTask *task, int elements);
